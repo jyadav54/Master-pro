@@ -932,69 +932,142 @@ function findPivots(candles, LB) {
 }
 function detectStructure(candles) {
   const n = candles.length;
-  const empty = { swings:[], trend:'NEUTRAL', events:[], lastHigh:null, lastLow:null, idm:null, idms:[], trendAt:new Array(n).fill(0), lastSwingHigh:null, lastSwingLow:null, anchorI:null };
-  if (n < 20) return empty;
+  const empty = { swings:[], trend:'NEUTRAL', events:[], lastHigh:null, lastLow:null, idm:null, idms:[], trendAt:new Array(n).fill(0), lastSwingHigh:null, lastSwingLow:null, protectedHigh:null, protectedLow:null, orderBlocks:[] };
+  if (n < 30) return empty;
   const LB = 3, EQ = 0.0006;
   const piv = findPivots(candles, LB);
   if (!piv.length) return empty;
+
   let pp = 0, trend = 0;
   let lastSH = null, lastSL = null, prevH = null, prevL = null;
-  let protLow = null, protHigh = null, pending = null, shiftPending = null, originI = null;
+  let protectedLow = null, protectedHigh = null;
+  let pendingMSS = false, mssFired = false;
+  let originI = null;
   const swings = [], events = [], idms = [], trendAt = new Array(n).fill(0);
+  const orderBlocks = [];
+
   for (let j = 0; j < n; j++) {
     while (pp < piv.length && piv[pp].conf <= j) {
       const s = { ...piv[pp++] };
       if (s.type === 'H') {
         s.label = !prevH ? 'SH' : Math.abs(s.price - prevH.price) / prevH.price <= EQ ? 'EQH' : s.price > prevH.price ? 'HH' : 'LH';
         prevH = s; lastSH = { i:s.i, price:s.price, crossed:false };
-        if (pending && pending.dir === 'BEARISH' && s.i > pending.after) { idms.push({ i:s.i, price:s.price, dir:'BEARISH', taken:false, takenAt:null }); pending = null; }
       } else {
         s.label = !prevL ? 'SL' : Math.abs(s.price - prevL.price) / prevL.price <= EQ ? 'EQL' : s.price > prevL.price ? 'HL' : 'LL';
         prevL = s; lastSL = { i:s.i, price:s.price, crossed:false };
-        if (pending && pending.dir === 'BULLISH' && s.i > pending.after) { idms.push({ i:s.i, price:s.price, dir:'BULLISH', taken:false, takenAt:null }); pending = null; }
       }
       swings.push(s);
     }
+
     const c = candles[j];
-    idms.forEach(m => { if (m.taken) return; if (m.dir === 'BULLISH' ? c.low < m.price : c.high > m.price) { m.taken = true; m.takenAt = j; } });
+    const a = atrAt(candles, j) || 1;
+    const body = Math.abs(c.close - c.open);
+    const isDisplacement = body > a * 1.2;
+
     if (lastSH && !lastSH.crossed && c.close > lastSH.price) {
       lastSH.crossed = true;
       let label = 'BOS';
-      if (trend === -1) { label = 'CHoCH'; shiftPending = 'BULLISH'; events.push({ i:j, from:lastSH.i, price:lastSH.price, dir:'BULLISH', label:'MSS' }); }
-      else if (shiftPending === 'BULLISH') { label = 'MSS'; shiftPending = null; }
+      if (trend === -1) {
+        label = 'CHoCH';
+        pendingMSS = true; mssFired = false;
+        if (isDisplacement) {
+          events.push({ i:j, from:lastSH.i, price:lastSH.price, dir:'BULLISH', label:'MSS' });
+          mssFired = true; pendingMSS = false;
+        }
+      } else if (trend === 1 && pendingMSS && !mssFired && isDisplacement) {
+        label = 'MSS';
+        mssFired = true; pendingMSS = false;
+      }
       events.push({ i:j, from:lastSH.i, price:lastSH.price, dir:'BULLISH', label });
-      const flip = trend !== 1; trend = 1;
+      if (trend !== 1) originI = j;
+      trend = 1;
       let m = Infinity, mi = lastSH.i;
       for (let k = lastSH.i; k <= j; k++) if (candles[k].low < m) { m = candles[k].low; mi = k; }
-      protLow = { price:m, i:mi };
-      if (flip || originI === null) originI = mi;
-      pending = { dir:'BULLISH', after:j };
-    } else if (lastSL && !lastSL.crossed && c.close < lastSL.price) {
+      protectedLow = { price:m, i:mi };
+
+      let obI = j - 1;
+      while (obI > 0 && candles[obI].close >= candles[obI].open) obI--;
+      if (obI > 0) {
+        orderBlocks.push({ i:obI, top:candles[obI].high, bottom:candles[obI].low, dir:'BULLISH', startTime:candles[obI].time });
+      }
+    }
+    else if (lastSL && !lastSL.crossed && c.close < lastSL.price) {
       lastSL.crossed = true;
       let label = 'BOS';
-      if (trend === 1) { label = 'CHoCH'; shiftPending = 'BEARISH'; events.push({ i:j, from:lastSL.i, price:lastSL.price, dir:'BEARISH', label:'MSS' }); }
-      else if (shiftPending === 'BEARISH') { label = 'MSS'; shiftPending = null; }
+      if (trend === 1) {
+        label = 'CHoCH';
+        pendingMSS = true; mssFired = false;
+        if (isDisplacement) {
+          events.push({ i:j, from:lastSL.i, price:lastSL.price, dir:'BEARISH', label:'MSS' });
+          mssFired = true; pendingMSS = false;
+        }
+      } else if (trend === -1 && pendingMSS && !mssFired && isDisplacement) {
+        label = 'MSS';
+        mssFired = true; pendingMSS = false;
+      }
       events.push({ i:j, from:lastSL.i, price:lastSL.price, dir:'BEARISH', label });
-      const flip = trend !== -1; trend = -1;
+      if (trend !== -1) originI = j;
+      trend = -1;
       let m = -Infinity, mi = lastSL.i;
       for (let k = lastSL.i; k <= j; k++) if (candles[k].high > m) { m = candles[k].high; mi = k; }
-      protHigh = { price:m, i:mi };
-      if (flip || originI === null) originI = mi;
-      pending = { dir:'BEARISH', after:j };
+      protectedHigh = { price:m, i:mi };
+
+      let obI = j - 1;
+      while (obI > 0 && candles[obI].close <= candles[obI].open) obI--;
+      if (obI > 0) {
+        orderBlocks.push({ i:obI, top:candles[obI].high, bottom:candles[obI].low, dir:'BEARISH', startTime:candles[obI].time });
+      }
     }
+
+    if (trend === 1 && lastSL && lastSL.i > (originI || 0)) {
+      const isMinor = lastSL.price > (protectedLow ? protectedLow.price : 0);
+      if (isMinor) {
+        let swept = false, sweptAt = null;
+        for (let k = lastSL.i + 1; k <= j; k++) {
+          if (candles[k].low < lastSL.price) { swept = true; sweptAt = k; break; }
+        }
+        if (swept && !idms.some(m => m.i === lastSL.i)) {
+          idms.push({ i:lastSL.i, price:lastSL.price, dir:'BULLISH', taken:true, takenAt:sweptAt });
+        }
+      }
+    }
+    if (trend === -1 && lastSH && lastSH.i > (originI || 0)) {
+      const isMinor = lastSH.price < (protectedHigh ? protectedHigh.price : Infinity);
+      if (isMinor) {
+        let swept = false, sweptAt = null;
+        for (let k = lastSH.i + 1; k <= j; k++) {
+          if (candles[k].high > lastSH.price) { swept = true; sweptAt = k; break; }
+        }
+        if (swept && !idms.some(m => m.i === lastSH.i)) {
+          idms.push({ i:lastSH.i, price:lastSH.price, dir:'BEARISH', taken:true, takenAt:sweptAt });
+        }
+      }
+    }
+
     trendAt[j] = trend;
   }
+
   const highs = swings.filter(s => s.type === 'H'), lows = swings.filter(s => s.type === 'L');
   const lastSwingHigh = highs.length ? highs[highs.length - 1] : null;
   const lastSwingLow = lows.length ? lows[lows.length - 1] : null;
   let lastHigh = lastSwingHigh ? lastSwingHigh.price : null, lastLow = lastSwingLow ? lastSwingLow.price : null;
-  let anchorI = null;
-  if (trend === 1 && protLow) { lastLow = protLow.price; anchorI = originI; let m = -Infinity; for (let k = protLow.i; k < n; k++) m = Math.max(m, candles[k].high); lastHigh = m; }
-  else if (trend === -1 && protHigh) { lastHigh = protHigh.price; anchorI = originI; let m = Infinity; for (let k = protHigh.i; k < n; k++) m = Math.min(m, candles[k].low); lastLow = m; }
+  if (trend === 1 && protectedLow) {
+    lastLow = protectedLow.price;
+    let m = -Infinity; for (let k = protectedLow.i; k < n; k++) m = Math.max(m, candles[k].high); lastHigh = m;
+  } else if (trend === -1 && protectedHigh) {
+    lastHigh = protectedHigh.price;
+    let m = Infinity; for (let k = protectedHigh.i; k < n; k++) m = Math.min(m, candles[k].low); lastLow = m;
+  }
   const want = trend === -1 ? 'BEARISH' : 'BULLISH';
   const mine = idms.filter(m => m.dir === want);
   const idm = mine.length ? mine[mine.length - 1] : null;
-  return { swings, trend: trend === 1 ? 'UP' : trend === -1 ? 'DOWN' : 'NEUTRAL', events: events.slice(-14), lastHigh, lastLow, idm, idms, trendAt, lastSwingHigh, lastSwingLow, anchorI };
+
+  return {
+    swings, trend: trend === 1 ? 'UP' : trend === -1 ? 'DOWN' : 'NEUTRAL',
+    events: events.slice(-14), lastHigh, lastLow, idm, idms, trendAt,
+    lastSwingHigh, lastSwingLow, protectedLow, protectedHigh,
+    orderBlocks: orderBlocks.slice(-10),
+  };
 }
 function detectFVG(candles, lb = 500) {
   const n = candles.length; if (n < 5) return [];
@@ -1253,13 +1326,14 @@ function calcLiquidity(candles) {
   if (n < 30) return { internal:[], external:[], sweptCount:0 };
   const p = candles[n-1].close;
   const minor = findPivots(candles, 3), major = findPivots(candles, 8);
-  const ext = new Set(major.map(x => x.type + x.i));
+  const extSet = new Set(major.map(x => x.type + x.i));
   const items = minor.map(pv => {
     let taken = false;
     for (let j = pv.conf; j < n; j++) { if (pv.type === 'H' ? candles[j].high > pv.price : candles[j].low < pv.price) { taken = true; break; } }
-    return { price:pv.price, type:pv.type, kind:pv.type, i:pv.i, swept:taken, level: ext.has(pv.type + pv.i) ? 'EXT' : 'INT' };
+    return { price:pv.price, type:pv.type, kind:pv.type, i:pv.i, swept:taken, level: extSet.has(pv.type + pv.i) ? 'EXT' : 'INT', eq:false };
   });
   const active = items.filter(x => !x.swept);
+  active.forEach(a => { a.eq = active.some(b => b !== a && b.type === a.type && Math.abs(b.price - a.price) / a.price <= 0.001); });
   const bsl = active.filter(x => x.type === 'H' && x.price > p).sort((a, b) => a.price - b.price);
   const ssl = active.filter(x => x.type === 'L' && x.price < p).sort((a, b) => b.price - a.price);
   const pick = lvl => [...bsl.filter(x => x.level === lvl).slice(0, 2), ...ssl.filter(x => x.level === lvl).slice(0, 2)].sort((a, b) => Math.abs(a.price - p) - Math.abs(b.price - p));
@@ -1269,7 +1343,11 @@ function calcVolumeProfile(candles, structure, bins = 24) {
   const n = candles.length;
   if (n < 30) return null;
   let startI = Math.max(0, n - 120);
-  if (structure && structure.anchorI != null) startI = Math.max(0, Math.min(structure.anchorI, n - 60));
+  if (structure && structure.protectedLow && structure.protectedLow.i) {
+    startI = Math.max(0, Math.min(structure.protectedLow.i, n - 60));
+  } else if (structure && structure.protectedHigh && structure.protectedHigh.i) {
+    startI = Math.max(0, Math.min(structure.protectedHigh.i, n - 60));
+  }
   startI = Math.max(startI, n - 300);
   const slice = candles.slice(startI);
   const hi = Math.max(...slice.map(c => c.high));
@@ -1283,18 +1361,21 @@ function calcVolumeProfile(candles, structure, bins = 24) {
     buckets[idx].vol += c.volume || 0;
   });
   const total = buckets.reduce((s, b) => s + b.vol, 0) || 1;
-  const poc = buckets.reduce((m, b) => b.vol > m.vol ? b : m, buckets[0]);
+  const pocBucket = buckets.reduce((m, b) => b.vol > m.vol ? b : m, buckets[0]);
+  const pocIdx = buckets.indexOf(pocBucket);
   const target = total * 0.7;
-  let acc = poc.vol, upIdx = buckets.indexOf(poc), loIdx = upIdx;
-  let upper = poc.price, lower = poc.price;
+  let acc = pocBucket.vol;
+  let upIdx = pocIdx, loIdx = pocIdx;
   while (acc < target) {
     const upV = buckets[upIdx + 1] ? buckets[upIdx + 1].vol : -1;
     const loV = buckets[loIdx - 1] ? buckets[loIdx - 1].vol : -1;
     if (upV < 0 && loV < 0) break;
-    if (upV >= loV) { acc += upV; upIdx++; upper = buckets[upIdx].price; }
-    else { acc += loV; loIdx--; lower = buckets[loIdx].price; }
+    if (upV >= loV) { acc += upV; upIdx++; }
+    else { acc += loV; loIdx--; }
   }
-  return { buckets, poc: poc.price, vah: upper, val: lower, hi, lo, step, startI, count: slice.length };
+  const vah = buckets[Math.min(upIdx, bins - 1)].price;
+  const val = buckets[Math.max(loIdx, 0)].price;
+  return { buckets, poc: pocBucket.price, vah, val, hi, lo, step, startI, count: slice.length, pocIdx, vahIdx: upIdx, valIdx: loIdx };
 }
 function altSwings(candles, LB = 5) {
   const hi = candles.map(c => c.high), lo = candles.map(c => c.low);
@@ -2356,28 +2437,38 @@ function renderScanner() {
 function recomputeAll() {
   const sk = ak(), cd = S.candles[sk];
   if (!cd || !cd.length) return;
+
   const sig = calcSig(cd); S.sigs[sk] = sig;
   S.divergence[sk] = detectDivergence(cd);
   S.cvd[sk] = calcCVD(cd);
   const sr = calcSR(cd);
   const trade = calcTradeLevels(cd, sig.sig, sr);
   S.levels[sk] = { sr, trade };
+
   const cc = cd.length > 40 ? cd.slice(0, -1) : cd;
+
   const structure = detectStructure(cc);
   const fvgs = detectFVG(cc);
+  const obs = detectOrderBlocks(cc, structure);
+  const pois = detectPOI(cc, fvgs, obs);
   const sweeps = detectSweeps(cc);
   const signals = calcSmcSignals(cc, structure, fvgs, sweeps);
   const positions = calcPositions(cd, structure, fvgs);
   const stats = { total: signals.length, tp1: signals.filter(s => s.status === 'TP1').length, sl: signals.filter(s => s.status === 'SL').length, open: signals.filter(s => s.status === 'ACTIVE').length };
-  S.smc[sk] = { structure, fvgs, sweeps, signals, positions, stats };
+
+  S.smc[sk] = { structure, fvgs, sweeps, signals, positions, stats, orderBlocks: obs, pois };
+
   S.fib[sk] = calcFibonacci(cd);
   S.range[sk] = calcPriceRange(cd);
   const vp = calcVolumeProfile(cc, structure); S.vp[sk] = vp;
+
   S.liq[sk] = calcLiquidity(cc);
   S.magnets[sk] = calcMagnets(cd, vp);
+
   const xabcd = detectXABCD(cd);
   const hs = detectHS(cd);
   S.patterns[sk] = [...xabcd, ...hs];
+
   S.ml = calcMLSignal(cd);
   S.liqMap = calcLiqMap(cd);
 }
